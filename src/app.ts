@@ -1,6 +1,7 @@
 import { Hono } from "hono";
-import { registerApiRoutes } from "./routes/api";
-import { registerHealthRoutes } from "./routes/health";
+import { createApiController } from "./controllers/apiController";
+import { createHealthController } from "./controllers/healthController";
+import { createLlmService } from "./services/factory";
 
 export type AppDependencies = {
   serviceName: string;
@@ -20,9 +21,10 @@ export const createDefaultDependencies = (): AppDependencies => {
 
 export const createApp = (dependencies: AppDependencies) => {
   const app = new Hono();
+  const llmService = createLlmService(dependencies);
 
-  registerHealthRoutes(app, dependencies);
-  registerApiRoutes(app, dependencies);
+  createHealthController(llmService)(app);
+  createApiController(llmService)(app);
 
   return app;
 };
