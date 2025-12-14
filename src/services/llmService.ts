@@ -1,10 +1,12 @@
 import type { ModelRepository } from "../repositories/modelRepository";
 import {
   buildChatCompletionResponse,
+  buildResponseOutput,
   buildModelsList,
   formatEchoContent,
   type ChatCompletionResponse,
   type ModelListResponse,
+  type ResponseResponse,
   type StatusResponse,
 } from "../utils/responses";
 import { pickString, pickValue } from "../utils/validation";
@@ -12,7 +14,7 @@ import { pickString, pickValue } from "../utils/validation";
 export interface LlmService {
   getStatus(): StatusResponse;
   listModels(): ModelListResponse;
-  createResponse(body: unknown): ChatCompletionResponse;
+  createResponse(body: unknown): ResponseResponse;
   createChatCompletion(body: unknown): ChatCompletionResponse;
 }
 
@@ -34,7 +36,7 @@ export class EchoLlmService implements LlmService {
     };
   }
 
-  createResponse(body: unknown): ChatCompletionResponse {
+  createResponse(body: unknown): ResponseResponse {
     const model = pickString(
       pickValue<string | undefined>(body, "model", undefined),
       this.modelRepository.defaultModel(),
@@ -43,7 +45,7 @@ export class EchoLlmService implements LlmService {
     const input = pickValue(body, "input", null);
     const messageContent = formatEchoContent(input);
 
-    return buildChatCompletionResponse("resp", model, messageContent);
+    return buildResponseOutput("resp", model, messageContent);
   }
 
   createChatCompletion(body: unknown): ChatCompletionResponse {

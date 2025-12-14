@@ -29,6 +29,27 @@ export type ChatCompletionChoice = {
   finish_reason: "stop";
 };
 
+export type OutputText = {
+  type: "output_text";
+  text: {
+    value: string;
+  };
+};
+
+export type ResponseOutput = {
+  content: OutputText[];
+};
+
+export type ResponseResponse = {
+  id: string;
+  object: "response";
+  created: number;
+  model: string;
+  output: ResponseOutput[];
+  stop_reason: "stop";
+  usage: null;
+};
+
 export type ChatCompletionResponse = {
   id: string;
   object: "chat.completion";
@@ -55,6 +76,29 @@ export const formatEchoContent = (payload: unknown) => {
 };
 
 const nowSeconds = () => Math.floor(Date.now() / 1000);
+
+export const buildResponseOutput = (
+  idPrefix: string,
+  model: string,
+  messageContent: string,
+): ResponseResponse => ({
+  id: safeRandomId(idPrefix),
+  object: "response",
+  created: nowSeconds(),
+  model,
+  output: [
+    {
+      content: [
+        {
+          type: "output_text",
+          text: { value: messageContent },
+        },
+      ],
+    },
+  ],
+  stop_reason: "stop",
+  usage: null,
+});
 
 export const buildChatCompletionResponse = (
   idPrefix: string,
