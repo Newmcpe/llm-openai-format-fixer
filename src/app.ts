@@ -1,25 +1,25 @@
 import { Hono } from "hono";
+import type { EnvConfig } from "./config/env";
+import { loadEnvConfig } from "./config/env";
 import { createApiController } from "./controllers/apiController";
 import { createHealthController } from "./controllers/healthController";
 import { createLlmService } from "./services/factory";
 
-export type AppDependencies = {
+export interface AppDependencies {
   serviceName: string;
   version: string;
   models: string[];
-};
+}
 
-export const createDefaultDependencies = (): AppDependencies => {
-  const modelsEnv = process.env.MODELS?.split(",").map((m) => m.trim()).filter(Boolean);
+export const createDefaultDependencies = (
+  envConfig: EnvConfig = loadEnvConfig(),
+): AppDependencies => ({
+  serviceName: envConfig.serviceName,
+  version: envConfig.serviceVersion,
+  models: envConfig.models,
+});
 
-  return {
-    serviceName: process.env.SERVICE_NAME?.trim() || "llm-openai-proxy",
-    version: process.env.SERVICE_VERSION?.trim() || "v1",
-    models: modelsEnv && modelsEnv.length > 0 ? modelsEnv : ["custom-llm"],
-  };
-};
-
-export const createApp = (dependencies: AppDependencies) => {
+export const createApp = (dependencies: AppDependencies): Hono => {
   const app = new Hono();
   const llmService = createLlmService(dependencies);
 

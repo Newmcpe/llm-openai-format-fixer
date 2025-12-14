@@ -1,10 +1,12 @@
 import { serve } from "bun";
+import { loadEnvConfig } from "./config/env";
 import { createApp, createDefaultDependencies } from "./app";
 
 export const startServer = () => {
-  const dependencies = createDefaultDependencies();
+  const envConfig = loadEnvConfig();
+  const dependencies = createDefaultDependencies(envConfig);
   const app = createApp(dependencies);
-  const port = Number(process.env.PORT || 3000);
+  const port = envConfig.port;
 
   return serve({
     fetch: app.fetch,
