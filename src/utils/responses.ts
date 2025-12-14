@@ -1,4 +1,4 @@
-import { randomUUID } from "crypto";
+import {randomUUID} from "crypto";
 
 export type StatusResponse = {
   status: string;
@@ -43,6 +43,24 @@ export type ResponseMessage = {
   content: ResponseContent[];
 };
 
+export type ToolCall = {
+    id: string;
+    type: "function";
+    function: {
+        name: string;
+        arguments: string;
+    };
+};
+
+export type ResponseFunctionCall = {
+    type: "function_call";
+    call_id: string;
+    name: string;
+    arguments: string;
+};
+
+export type ResponseOutputItem = ResponseMessage | ResponseFunctionCall;
+
 export type ResponseResponse = {
   id: string;
   object: "response";
@@ -50,29 +68,23 @@ export type ResponseResponse = {
   status: "completed";
   error: null;
   incomplete_details: null;
-  instructions: null;
-  max_output_tokens: null;
+    instructions: string | null;
+    max_output_tokens: number | null;
   model: string;
-  output: ResponseMessage[];
-  parallel_tool_calls: true;
-  previous_response_id: null;
+    output: ResponseOutputItem[];
+    parallel_tool_calls: boolean;
+    previous_response_id: string | null;
   reasoning: { effort: null; summary: null };
-  store: true;
+    store: boolean;
   temperature: number;
-  text: { format: { type: "text" } };
-  tool_choice: "auto";
-  tools: [];
+    text: unknown;
+    tool_choice: unknown;
+    tools: unknown[];
   top_p: number;
   truncation: "disabled";
-  usage: {
-    input_tokens: number;
-    input_tokens_details: { cached_tokens: number };
-    output_tokens: number;
-    output_tokens_details: { reasoning_tokens: number };
-    total_tokens: number;
-  };
+    usage: unknown;
   user: null;
-  metadata: Record<string, never>;
+    metadata: Record<string, unknown>;
   output_text: string;
 };
 
@@ -104,6 +116,90 @@ export const formatEchoContent = (payload: unknown) => {
 const nowSeconds = () => Math.floor(Date.now() / 1000);
 
 const estimateTokens = (text: string) => Math.max(1, Math.ceil(text.length / 4));
+
+type ResponsesProxyOutputRequest = {
+    instructions: string | null;
+    max_output_tokens: number | null;
+    previous_response_id: string | null;
+    store: boolean;
+    temperature: number;
+    text: unknown;
+    tool_choice: unknown;
+    tools: unknown[];
+    top_p: number;
+    parallel_tool_calls: boolean;
+    usage: unknown;
+    metadata: Record<string, unknown>;
+};
+
+type BuildResponsesProxyOutputArgs = {
+    model: string;
+    assistantText: string;
+    toolCalls: ToolCall[];
+    request: ResponsesProxyOutputRequest;
+};
+
+export const buildResponsesProxyOutput = ({
+                                              model,
+                                              assistantText,
+                                              toolCalls,
+                                              request,
+                                          }: BuildResponsesProxyOutputArgs): ResponseResponse => {
+    const respId = safeRandomId("resp");
+    const msgId = safeRandomId("msg");
+    const created_at = nowSeconds();
+
+    const content: ResponseContent[] = [];
+    if (assistantText) {
+        content.push({type: "output_text", text: assistantText, annotations: []});
+    }
+
+    const output: ResponseOutputItem[] = [
+        {
+            type: "message",
+            id: msgId,
+            status: "completed",
+            role: "assistant",
+            content,
+        },
+    ];
+
+    for (const tc of toolCalls) {
+        output.push({
+            type: "function_call",
+            call_id: tc.id,
+            name: tc.function?.name ?? "",
+            arguments: tc.function?.arguments ?? "",
+        });
+    }
+
+    return {
+        id: respId,
+        object: "response",
+        created_at,
+        status: "completed",
+        error: null,
+        incomplete_details: null,
+        instructions: request.instructions,
+        max_output_tokens: request.max_output_tokens,
+        model,
+        output,
+        parallel_tool_calls: request.parallel_tool_calls,
+        previous_response_id: request.previous_response_id,
+        reasoning: {effort: null, summary: null},
+        store: request.store,
+        temperature: request.temperature,
+        text: request.text,
+        tool_choice: request.tool_choice,
+        tools: request.tools,
+        top_p: request.top_p,
+        truncation: "disabled",
+        usage: request.usage,
+        user: null,
+        metadata: request.metadata,
+        output_text: assistantText,
+    };
+};
 
 export const buildResponseOutput = (
   idPrefix: string,

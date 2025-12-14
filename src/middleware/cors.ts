@@ -1,4 +1,4 @@
-import type { MiddlewareHandler } from "hono";
+import type {MiddlewareHandler} from "hono";
 
 const allowedHeaders = [
   "Content-Type",
@@ -6,6 +6,7 @@ const allowedHeaders = [
   "X-Requested-With",
   "Accept",
   "Origin",
+    "x-proxy-key",
 ];
 
 export const cors: MiddlewareHandler = async (c, next) => {

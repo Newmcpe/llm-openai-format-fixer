@@ -1,17 +1,20 @@
-import { Hono } from "hono";
-import type { EnvConfig } from "./config/env";
-import { loadEnvConfig } from "./config/env";
-import { createApiController } from "./controllers/apiController";
-import { createHealthController } from "./controllers/healthController";
-import { cors } from "./middleware/cors";
-import { errorHandler } from "./middleware/errorHandler";
-import { logger } from "./middleware/logger";
-import { createLlmService } from "./services/factory";
+import {Hono} from "hono";
+import type {EnvConfig} from "./config/env";
+import {loadEnvConfig} from "./config/env";
+import {createApiController} from "./controllers/apiController";
+import {createHealthController} from "./controllers/healthController";
+import {cors} from "./middleware/cors";
+import {errorHandler} from "./middleware/errorHandler";
+import {logger} from "./middleware/logger";
+import {createLlmService} from "./services/factory";
 
 export interface AppDependencies {
   serviceName: string;
   version: string;
   models: string[];
+    customLlmUrl: string;
+    customLlmKey: string;
+    proxyKey: string;
 }
 
 export const createDefaultDependencies = (
@@ -20,6 +23,9 @@ export const createDefaultDependencies = (
   serviceName: envConfig.serviceName,
   version: envConfig.serviceVersion,
   models: envConfig.models,
+    customLlmUrl: envConfig.customLlmUrl,
+    customLlmKey: envConfig.customLlmKey,
+    proxyKey: envConfig.proxyKey,
 });
 
 export const createApp = (dependencies: AppDependencies): Hono => {
@@ -31,7 +37,7 @@ export const createApp = (dependencies: AppDependencies): Hono => {
   app.use("*", cors);
 
   createHealthController(llmService)(app);
-  createApiController(llmService)(app);
+    createApiController(llmService, dependencies.proxyKey)(app);
 
   return app;
 };

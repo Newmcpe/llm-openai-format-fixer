@@ -3,6 +3,9 @@ export interface EnvConfig {
   serviceVersion: string;
   models: string[];
   port: number;
+    customLlmUrl: string;
+    customLlmKey: string;
+    proxyKey: string;
 }
 
 const parseString = (value: string | undefined, fallback: string): string => {
@@ -32,5 +35,8 @@ export const loadEnvConfig = (
     serviceVersion: parseString(env.SERVICE_VERSION, "v1"),
     models: parseModels(env.MODELS, ["custom-llm"]),
     port: parseNumber(env.PORT, 3000),
+      customLlmUrl: parseString(env.CUSTOM_LLM_URL, ""),
+      customLlmKey: parseString(env.CUSTOM_LLM_KEY, ""),
+      proxyKey: parseString(env.PROXY_KEY, ""),
   };
 };
