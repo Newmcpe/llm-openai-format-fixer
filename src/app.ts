@@ -3,6 +3,9 @@ import type { EnvConfig } from "./config/env";
 import { loadEnvConfig } from "./config/env";
 import { createApiController } from "./controllers/apiController";
 import { createHealthController } from "./controllers/healthController";
+import { cors } from "./middleware/cors";
+import { errorHandler } from "./middleware/errorHandler";
+import { logger } from "./middleware/logger";
 import { createLlmService } from "./services/factory";
 
 export interface AppDependencies {
@@ -22,6 +25,10 @@ export const createDefaultDependencies = (
 export const createApp = (dependencies: AppDependencies): Hono => {
   const app = new Hono();
   const llmService = createLlmService(dependencies);
+
+  app.use("*", errorHandler);
+  app.use("*", logger);
+  app.use("*", cors);
 
   createHealthController(llmService)(app);
   createApiController(llmService)(app);
