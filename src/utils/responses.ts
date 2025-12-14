@@ -29,25 +29,50 @@ export type ChatCompletionChoice = {
   finish_reason: "stop";
 };
 
-export type OutputText = {
+export type ResponseMessageContent = {
   type: "output_text";
-  text: {
-    value: string;
-  };
+  text: string;
+  annotations: [];
 };
 
-export type ResponseOutput = {
-  content: OutputText[];
+export type ResponseMessage = {
+  type: "message";
+  id: string;
+  status: "completed";
+  role: "assistant";
+  content: ResponseMessageContent[];
 };
 
 export type ResponseResponse = {
   id: string;
   object: "response";
-  created: number;
+  created_at: number;
+  status: "completed";
+  error: null;
+  incomplete_details: null;
+  instructions: null;
+  max_output_tokens: null;
   model: string;
-  output: ResponseOutput[];
-  stop_reason: "stop";
-  usage: null;
+  output: ResponseMessage[];
+  parallel_tool_calls: true;
+  previous_response_id: null;
+  reasoning: { effort: null; summary: null };
+  store: true;
+  temperature: number;
+  text: { format: { type: "text" } };
+  tool_choice: "auto";
+  tools: [];
+  top_p: number;
+  truncation: "disabled";
+  usage: {
+    input_tokens: number;
+    input_tokens_details: { cached_tokens: number };
+    output_tokens: number;
+    output_tokens_details: { reasoning_tokens: number };
+    total_tokens: number;
+  };
+  user: null;
+  metadata: Record<string, never>;
 };
 
 export type ChatCompletionResponse = {
@@ -77,28 +102,60 @@ export const formatEchoContent = (payload: unknown) => {
 
 const nowSeconds = () => Math.floor(Date.now() / 1000);
 
+const estimateTokens = (text: string) => Math.max(1, Math.ceil(text.length / 4));
+
 export const buildResponseOutput = (
   idPrefix: string,
   model: string,
   messageContent: string,
-): ResponseResponse => ({
-  id: safeRandomId(idPrefix),
-  object: "response",
-  created: nowSeconds(),
-  model,
-  output: [
-    {
-      content: [
-        {
-          type: "output_text",
-          text: { value: messageContent },
-        },
-      ],
+): ResponseResponse => {
+  const createdAt = nowSeconds();
+  const messageId = safeRandomId("msg");
+  const inputTokens = 0;
+  const outputTokens = estimateTokens(messageContent);
+
+  return {
+    id: safeRandomId(idPrefix),
+    object: "response",
+    created_at: createdAt,
+    status: "completed",
+    error: null,
+    incomplete_details: null,
+    instructions: null,
+    max_output_tokens: null,
+    model,
+    output: [
+      {
+        type: "message",
+        id: messageId,
+        status: "completed",
+        role: "assistant",
+        content: [
+          { type: "output_text", text: messageContent, annotations: [] },
+        ],
+      },
+    ],
+    parallel_tool_calls: true,
+    previous_response_id: null,
+    reasoning: { effort: null, summary: null },
+    store: true,
+    temperature: 1.0,
+    text: { format: { type: "text" } },
+    tool_choice: "auto",
+    tools: [],
+    top_p: 1.0,
+    truncation: "disabled",
+    usage: {
+      input_tokens: inputTokens,
+      input_tokens_details: { cached_tokens: 0 },
+      output_tokens: outputTokens,
+      output_tokens_details: { reasoning_tokens: 0 },
+      total_tokens: inputTokens + outputTokens,
     },
-  ],
-  stop_reason: "stop",
-  usage: null,
-});
+    user: null,
+    metadata: {},
+  };
+};
 
 export const buildChatCompletionResponse = (
   idPrefix: string,
