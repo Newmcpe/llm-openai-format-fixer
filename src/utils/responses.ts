@@ -30,14 +30,16 @@ export type ChatCompletionChoice = {
 };
 
 export type ResponseContent = {
-  type: "text";
-  text: {
-    value: string;
-    annotations: [];
-  };
+  type: "output_text";
+  text: string;
+  annotations: [];
 };
 
-export type ResponseOutput = {
+export type ResponseMessage = {
+  type: "message";
+  id: string;
+  status: "completed";
+  role: "assistant";
   content: ResponseContent[];
 };
 
@@ -71,6 +73,7 @@ export type ResponseResponse = {
   };
   user: null;
   metadata: Record<string, never>;
+  output_text: string;
 };
 
 export type ChatCompletionResponse = {
@@ -106,22 +109,56 @@ export const buildResponseOutput = (
   idPrefix: string,
   model: string,
   messageContent: string,
-): ResponseResponse => ({
-  id: safeRandomId(idPrefix),
-  object: "response",
-  created: nowSeconds(),
-  model,
-  output: [
-    {
-      content: [
-        {
-          type: "text",
-          text: { value: messageContent, annotations: [] },
-        },
-      ],
+): ResponseResponse => {
+  const id = safeRandomId(idPrefix);
+  const created_at = nowSeconds();
+  const output_tokens = estimateTokens(messageContent);
+
+  const message: ResponseMessage = {
+    type: "message",
+    id: safeRandomId(`${idPrefix}-msg`),
+    status: "completed",
+    role: "assistant",
+    content: [
+      {
+        type: "output_text",
+        text: messageContent,
+        annotations: [],
+      },
+    ],
+  };
+
+  return {
+    id,
+    object: "response",
+    created_at,
+    status: "completed",
+    error: null,
+    incomplete_details: null,
+    instructions: null,
+    max_output_tokens: null,
+    model,
+    output: [message],
+    parallel_tool_calls: true,
+    previous_response_id: null,
+    reasoning: { effort: null, summary: null },
+    store: true,
+    temperature: 1,
+    text: { format: { type: "text" } },
+    tool_choice: "auto",
+    tools: [],
+    top_p: 1,
+    truncation: "disabled",
+    usage: {
+      input_tokens: 0,
+      input_tokens_details: { cached_tokens: 0 },
+      output_tokens,
+      output_tokens_details: { reasoning_tokens: 0 },
+      total_tokens: output_tokens,
     },
     user: null,
     metadata: {},
+    output_text: messageContent,
   };
 };
 
