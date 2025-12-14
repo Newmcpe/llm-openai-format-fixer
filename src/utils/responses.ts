@@ -29,15 +29,16 @@ export type ChatCompletionChoice = {
   finish_reason: "stop";
 };
 
-export type OutputText = {
-  type: "output_text";
+export type ResponseContent = {
+  type: "text";
   text: {
     value: string;
+    annotations: [];
   };
 };
 
 export type ResponseOutput = {
-  content: OutputText[];
+  content: ResponseContent[];
 };
 
 export type ResponseResponse = {
@@ -90,8 +91,8 @@ export const buildResponseOutput = (
     {
       content: [
         {
-          type: "output_text",
-          text: { value: messageContent },
+          type: "text",
+          text: { value: messageContent, annotations: [] },
         },
       ],
     },
