@@ -1,6 +1,11 @@
 import type { Hono } from "hono";
 import type { AppDependencies } from "../app";
 
-export const registerHealthRoutes = (app: Hono, { serviceName }: AppDependencies) => {
-  app.get("/health", (c) => c.json({ ok: true, service: serviceName }));
+export interface HealthResponse {
+  ok: boolean;
+  service: string;
+}
+
+export const registerHealthRoutes = (app: Hono, { serviceName }: AppDependencies): void => {
+  app.get("/health", (c) => c.json<HealthResponse>({ ok: true, service: serviceName }));
 };

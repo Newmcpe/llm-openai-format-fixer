@@ -1,24 +1,25 @@
 import { Hono } from "hono";
+import { loadEnvConfig } from "@/config/env";
 import { registerApiRoutes } from "./routes/api";
 import { registerHealthRoutes } from "./routes/health";
 
-export type AppDependencies = {
+export interface AppDependencies {
   serviceName: string;
   version: string;
   models: string[];
-};
+}
 
 export const createDefaultDependencies = (): AppDependencies => {
-  const modelsEnv = process.env.MODELS?.split(",").map((m) => m.trim()).filter(Boolean);
+  const envConfig = loadEnvConfig();
 
   return {
-    serviceName: process.env.SERVICE_NAME?.trim() || "llm-openai-proxy",
-    version: process.env.SERVICE_VERSION?.trim() || "v1",
-    models: modelsEnv && modelsEnv.length > 0 ? modelsEnv : ["custom-llm"],
+    serviceName: envConfig.serviceName,
+    version: envConfig.serviceVersion,
+    models: envConfig.models,
   };
 };
 
-export const createApp = (dependencies: AppDependencies) => {
+export const createApp = (dependencies: AppDependencies): Hono => {
   const app = new Hono();
 
   registerHealthRoutes(app, dependencies);
