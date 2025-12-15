@@ -732,10 +732,12 @@ const createAnthropicStreamFromOpenAI = (
     let buffer = "";
     let sentMessageStart = false;
     let contentBlockStarted = false;
+    let contentBlockStopped = false;
     let currentToolCallIndex = -1;
     let pullCount = 0;
     let totalTextLength = 0;
     const toolCallsInProgress: Map<number, { id: string; name: string; arguments: string }> = new Map();
+    const closedToolCallIndices: Set<number> = new Set();
 
     const msgId = `msg_${crypto.randomUUID()}`;
 
@@ -750,8 +752,17 @@ const createAnthropicStreamFromOpenAI = (
                     totalTextLength,
                     toolCallsCount: toolCallsInProgress.size
                 });
-                if (contentBlockStarted) {
+                // Close text content block if started but not yet stopped
+                if (contentBlockStarted && !contentBlockStopped) {
                     controller.enqueue(encoder.encode(`event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n`));
+                    contentBlockStopped = true;
+                }
+                // Close any unclosed tool call blocks
+                for (const [tcIdx] of toolCallsInProgress) {
+                    if (!closedToolCallIndices.has(tcIdx)) {
+                        controller.enqueue(encoder.encode(`event: content_block_stop\ndata: {"type":"content_block_stop","index":${tcIdx + 1}}\n\n`));
+                        closedToolCallIndices.add(tcIdx);
+                    }
                 }
                 controller.enqueue(encoder.encode(`event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null}}\n\n`));
                 controller.enqueue(encoder.encode(`event: message_stop\ndata: {"type":"message_stop"}\n\n`));
@@ -801,77 +812,88 @@ const createAnthropicStreamFromOpenAI = (
                 }
 
                 const delta = obj?.choices?.[0]?.delta;
-                if (!delta) continue;
+                const finishReason = obj?.choices?.[0]?.finish_reason;
 
                 // Handle text content (including reasoning_content from thinking models)
-                const textContent = delta.content ?? delta.reasoning_content;
-                if (typeof textContent === "string" && textContent) {
-                    totalTextLength += textContent.length;
-                    if (!contentBlockStarted) {
-                        controller.enqueue(encoder.encode(`event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n`));
-                        contentBlockStarted = true;
-                    }
-                    const deltaEvent = {
-                        type: "content_block_delta",
-                        index: 0,
-                        delta: {type: "text_delta", text: textContent},
-                    };
-                    controller.enqueue(encoder.encode(`event: content_block_delta\ndata: ${JSON.stringify(deltaEvent)}\n\n`));
-                }
-
-                // Handle tool calls
-                if (Array.isArray(delta.tool_calls)) {
-                    for (const tc of delta.tool_calls) {
-                        const tcIndex = tc.index ?? 0;
-
-                        if (!toolCallsInProgress.has(tcIndex)) {
-                            if (contentBlockStarted && currentToolCallIndex === -1) {
-                                controller.enqueue(encoder.encode(`event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n`));
-                            }
-                            currentToolCallIndex = tcIndex;
-                            toolCallsInProgress.set(tcIndex, {
-                                id: tc.id || "",
-                                name: tc.function?.name || "",
-                                arguments: "",
-                            });
-
-                            const blockStart = {
-                                type: "content_block_start",
-                                index: tcIndex + 1,
-                                content_block: {
-                                    type: "tool_use",
-                                    id: tc.id || "",
-                                    name: tc.function?.name || "",
-                                    input: {},
-                                },
-                            };
-                            controller.enqueue(encoder.encode(`event: content_block_start\ndata: ${JSON.stringify(blockStart)}\n\n`));
+                if (delta) {
+                    const textContent = delta.content ?? delta.reasoning_content;
+                    if (typeof textContent === "string") {
+                        // Start content block if not started
+                        if (!contentBlockStarted) {
+                            controller.enqueue(encoder.encode(`event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n`));
+                            contentBlockStarted = true;
                         }
-
-                        const existing = toolCallsInProgress.get(tcIndex)!;
-                        if (tc.function?.arguments) {
-                            existing.arguments += tc.function.arguments;
+                        // Send delta even for empty strings to maintain event order
+                        if (textContent) {
+                            totalTextLength += textContent.length;
                             const deltaEvent = {
                                 type: "content_block_delta",
-                                index: tcIndex + 1,
-                                delta: {type: "input_json_delta", partial_json: tc.function.arguments},
+                                index: 0,
+                                delta: {type: "text_delta", text: textContent},
                             };
                             controller.enqueue(encoder.encode(`event: content_block_delta\ndata: ${JSON.stringify(deltaEvent)}\n\n`));
                         }
                     }
+
+                    // Handle tool calls
+                    if (Array.isArray(delta.tool_calls)) {
+                        for (const tc of delta.tool_calls) {
+                            const tcIndex = tc.index ?? 0;
+
+                            if (!toolCallsInProgress.has(tcIndex)) {
+                                // Close text content block before starting tool calls
+                                if (contentBlockStarted && !contentBlockStopped && currentToolCallIndex === -1) {
+                                    controller.enqueue(encoder.encode(`event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n`));
+                                    contentBlockStopped = true;
+                                }
+                                currentToolCallIndex = tcIndex;
+                                toolCallsInProgress.set(tcIndex, {
+                                    id: tc.id || "",
+                                    name: tc.function?.name || "",
+                                    arguments: "",
+                                });
+
+                                const blockStart = {
+                                    type: "content_block_start",
+                                    index: tcIndex + 1,
+                                    content_block: {
+                                        type: "tool_use",
+                                        id: tc.id || "",
+                                        name: tc.function?.name || "",
+                                        input: {},
+                                    },
+                                };
+                                controller.enqueue(encoder.encode(`event: content_block_start\ndata: ${JSON.stringify(blockStart)}\n\n`));
+                            }
+
+                            const existing = toolCallsInProgress.get(tcIndex)!;
+                            if (tc.function?.arguments) {
+                                existing.arguments += tc.function.arguments;
+                                const deltaEvent = {
+                                    type: "content_block_delta",
+                                    index: tcIndex + 1,
+                                    delta: {type: "input_json_delta", partial_json: tc.function.arguments},
+                                };
+                                controller.enqueue(encoder.encode(`event: content_block_delta\ndata: ${JSON.stringify(deltaEvent)}\n\n`));
+                            }
+                        }
+                    }
                 }
 
-                // Handle finish reason
-                const finishReason = obj?.choices?.[0]?.finish_reason;
+                // Handle finish reason - must come AFTER processing deltas
                 if (finishReason) {
-                    // Close text content block if it was started
-                    if (contentBlockStarted) {
+                    // Close text content block if it was started but not stopped
+                    if (contentBlockStarted && !contentBlockStopped) {
                         controller.enqueue(encoder.encode(`event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n`));
+                        contentBlockStopped = true;
                     }
 
                     // Close tool call blocks
                     for (const [tcIdx] of toolCallsInProgress) {
-                        controller.enqueue(encoder.encode(`event: content_block_stop\ndata: {"type":"content_block_stop","index":${tcIdx + 1}}\n\n`));
+                        if (!closedToolCallIndices.has(tcIdx)) {
+                            controller.enqueue(encoder.encode(`event: content_block_stop\ndata: {"type":"content_block_stop","index":${tcIdx + 1}}\n\n`));
+                            closedToolCallIndices.add(tcIdx);
+                        }
                     }
 
                     let stopReason = "end_turn";
