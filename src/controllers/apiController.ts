@@ -68,7 +68,19 @@ export const createApiController = (llmService: LlmService, proxyKey: string) =>
           }
 
           const body = await readJsonBody(c.req);
-      return c.json(await llmService.createChatCompletion(body));
+          const result = await llmService.createChatCompletion(body);
+
+          if (result instanceof ReadableStream) {
+              return new Response(result, {
+                  headers: {
+                      "content-type": "text/event-stream",
+                      "cache-control": "no-cache",
+                      "connection": "keep-alive",
+                  },
+              });
+          }
+
+          return c.json(result);
       } catch (error) {
           if (error instanceof UpstreamProxyError) {
               return c.json(error.payload, toContentfulStatus(error.status));

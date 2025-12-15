@@ -170,7 +170,7 @@ export interface LlmService {
 
     createResponse(body: unknown): Promise<ResponseResponse>;
 
-    createChatCompletion(body: unknown): Promise<ChatCompletionResponse>;
+    createChatCompletion(body: unknown): Promise<ChatCompletionResponse | ReadableStream<Uint8Array>>;
 
     createAnthropicMessage(body: AnthropicMessagesRequest): Promise<AnthropicMessagesResponse | ReadableStream<Uint8Array>>;
 }
@@ -205,7 +205,7 @@ export class EchoLlmService implements LlmService {
     return buildResponseOutput("resp", model, messageContent);
   }
 
-    async createChatCompletion(body: unknown): Promise<ChatCompletionResponse> {
+    async createChatCompletion(body: unknown): Promise<ChatCompletionResponse | ReadableStream<Uint8Array>> {
     const model = pickString(
       pickValue<string | undefined>(body, "model", undefined),
       this.modelRepository.defaultModel(),
@@ -714,6 +714,81 @@ const openAIToAnthropicResponse = (
     };
 };
 
+const createChatCompletionPassThroughStream = (
+    upstreamResp: Response,
+): ReadableStream<Uint8Array> => {
+    const encoder = new TextEncoder();
+    const decoder = new TextDecoder("utf-8");
+    const reader = upstreamResp.body?.getReader();
+
+    if (!reader) {
+        throw new Error("Upstream response has no body");
+    }
+
+    let buffer = "";
+    let chunkNum = 0;
+
+    return new ReadableStream<Uint8Array>({
+        async pull(controller) {
+            const {done, value} = await reader.read();
+
+            if (done) {
+                log("info", "chat_completion_stream_done", {chunkNum});
+                controller.close();
+                return;
+            }
+
+            buffer += decoder.decode(value, {stream: true});
+            const lines = buffer.split("\n");
+            buffer = lines.pop() || "";
+
+            for (const line of lines) {
+                const trimmed = line.trim();
+                if (!trimmed) continue;
+
+                // Pass through [DONE] as-is
+                if (trimmed === "data: [DONE]") {
+                    controller.enqueue(encoder.encode(trimmed + "\n\n"));
+                    continue;
+                }
+
+                if (!trimmed.startsWith("data: ")) continue;
+
+                const jsonStr = trimmed.slice(6);
+                let obj: any;
+                try {
+                    obj = JSON.parse(jsonStr);
+                } catch {
+                    // Pass through unparseable lines as-is
+                    controller.enqueue(encoder.encode(trimmed + "\n\n"));
+                    continue;
+                }
+
+                chunkNum++;
+                const delta = obj?.choices?.[0]?.delta;
+
+                // Skip chunks that only have reasoning_content (no content)
+                if (delta?.reasoning_content && !delta?.content) {
+                    log("info", "skipping_reasoning_chunk", {chunkNum});
+                    continue;
+                }
+
+                // Remove reasoning_content from delta if present alongside content
+                if (delta?.reasoning_content) {
+                    delete delta.reasoning_content;
+                }
+
+                // Forward the (possibly modified) chunk
+                const outputLine = `data: ${JSON.stringify(obj)}\n\n`;
+                controller.enqueue(encoder.encode(outputLine));
+            }
+        },
+        cancel() {
+            reader.cancel();
+        },
+    });
+};
+
 const createAnthropicStreamFromOpenAI = (
     upstreamResp: Response,
     model: string,
@@ -1071,7 +1146,7 @@ export class ProxyLlmService implements LlmService {
         });
     }
 
-    async createChatCompletion(body: unknown): Promise<ChatCompletionResponse> {
+    async createChatCompletion(body: unknown): Promise<ChatCompletionResponse | ReadableStream<Uint8Array>> {
         const bodyObj = (body ?? {}) as Record<string, unknown>;
         const model = pickString(
             pickValue<string | undefined>(body, "model", undefined),
@@ -1127,6 +1202,13 @@ export class ProxyLlmService implements LlmService {
 
         const isSse = contentType.includes("text/event-stream");
 
+        // If client requested streaming and upstream is SSE, pass through the stream
+        if (isStreaming && isSse) {
+            log("info", "upstream_streaming_started");
+            return createChatCompletionPassThroughStream(upstreamResp);
+        }
+
+        // Non-streaming: assemble the response
         let assembled;
         if (isSse) {
             log("info", "upstream_streaming_started");
