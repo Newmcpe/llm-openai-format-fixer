@@ -547,9 +547,6 @@ const readSSEAndAssembleChatCompletion = async (
             if (typeof delta?.content === "string") {
                 assistantText += delta.content;
             }
-            if (typeof delta?.reasoning_content === "string") {
-                assistantText += delta.reasoning_content;
-            }
             if (typeof delta?.text === "string") {
                 assistantText += delta.text;
             }
@@ -814,9 +811,9 @@ const createAnthropicStreamFromOpenAI = (
                 const delta = obj?.choices?.[0]?.delta;
                 const finishReason = obj?.choices?.[0]?.finish_reason;
 
-                // Handle text content (including reasoning_content from thinking models)
+                // Handle text content
                 if (delta) {
-                    const textContent = delta.content ?? delta.reasoning_content;
+                    const textContent = delta.content;
                     if (typeof textContent === "string") {
                         // Start content block if not started
                         if (!contentBlockStarted) {
