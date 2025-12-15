@@ -984,7 +984,7 @@ export class ProxyLlmService implements LlmService {
             throw new Error("CUSTOM_LLM_URL is not set/invalid");
         }
 
-        const upstreamStream = request.stream === true;
+        const upstreamStream = true; // Always stream from upstream
 
         const requestBody = {...chatReq, stream: upstreamStream};
         log("info", "upstream_request", {method: "POST", url: upstreamChatUrl, body: safePreview(requestBody)});
