@@ -34,6 +34,7 @@ type ResponsesRequestBody = {
     parallel_tool_calls?: boolean;
     text?: ResponsesText;
     metadata?: Record<string, unknown>;
+    stream?: boolean;
 };
 
 type ChatCompletionsMessage = {
@@ -75,13 +76,81 @@ type ChatCompletionsRequestBody = {
     response_format?: ChatCompletionsResponseFormat;
 };
 
+// Anthropic Messages API types
+type AnthropicContentBlock =
+    | { type: "text"; text: string }
+    | { type: "tool_use"; id: string; name: string; input: unknown }
+    | { type: "tool_result"; tool_use_id: string; content: string };
+
+type AnthropicMessage = {
+    role: "user" | "assistant";
+    content: string | AnthropicContentBlock[];
+};
+
+type AnthropicTool = {
+    name: string;
+    description?: string;
+    input_schema: unknown;
+};
+
+type AnthropicToolChoice =
+    | { type: "auto" }
+    | { type: "any" }
+    | { type: "tool"; name: string };
+
+export type AnthropicMessagesRequest = {
+    model: string;
+    max_tokens: number;
+    messages: AnthropicMessage[];
+    system?: string;
+    stream?: boolean;
+    temperature?: number;
+    top_p?: number;
+    tools?: AnthropicTool[];
+    tool_choice?: AnthropicToolChoice;
+    stop_sequences?: string[];
+};
+
+export type AnthropicMessagesResponse = {
+    id: string;
+    type: "message";
+    role: "assistant";
+    content: AnthropicContentBlock[];
+    model: string;
+    stop_reason: "end_turn" | "max_tokens" | "stop_sequence" | "tool_use" | null;
+    stop_sequence: string | null;
+    usage: {
+        input_tokens: number;
+        output_tokens: number;
+    };
+};
+
+export type AnthropicStreamEvent =
+    | { type: "message_start"; message: Omit<AnthropicMessagesResponse, "content"> & { content: [] } }
+    | { type: "content_block_start"; index: number; content_block: AnthropicContentBlock }
+    | {
+    type: "content_block_delta";
+    index: number;
+    delta: { type: "text_delta"; text: string } | { type: "input_json_delta"; partial_json: string }
+}
+    | { type: "content_block_stop"; index: number }
+    | {
+    type: "message_delta";
+    delta: { stop_reason: string | null; stop_sequence: string | null };
+    usage?: { output_tokens: number }
+}
+    | { type: "message_stop" };
+
 export interface LlmService {
   getStatus(): StatusResponse;
-  listModels(): ModelListResponse;
+
+    listModels(): Promise<ModelListResponse>;
 
     createResponse(body: unknown): Promise<ResponseResponse>;
 
     createChatCompletion(body: unknown): Promise<ChatCompletionResponse>;
+
+    createAnthropicMessage(body: AnthropicMessagesRequest): Promise<AnthropicMessagesResponse | ReadableStream<Uint8Array>>;
 }
 
 export class EchoLlmService implements LlmService {
@@ -95,7 +164,7 @@ export class EchoLlmService implements LlmService {
     return { status: "ok", service: this.serviceName, version: this.version };
   }
 
-  listModels(): ModelListResponse {
+    async listModels(): Promise<ModelListResponse> {
     return {
       object: "list",
       data: buildModelsList(this.modelRepository.listModels(), this.serviceName),
@@ -125,7 +194,60 @@ export class EchoLlmService implements LlmService {
 
     return buildChatCompletionResponse("chatcmpl", model, messageContent);
   }
+
+    async createAnthropicMessage(body: AnthropicMessagesRequest): Promise<AnthropicMessagesResponse> {
+        const model = pickString(body.model, this.modelRepository.defaultModel());
+        const echoContent = formatEchoContent(body.messages);
+
+        return {
+            id: `msg_${crypto.randomUUID()}`,
+            type: "message",
+            role: "assistant",
+            content: [{type: "text", text: echoContent}],
+            model,
+            stop_reason: "end_turn",
+            stop_sequence: null,
+            usage: {
+                input_tokens: Math.ceil(echoContent.length / 4),
+                output_tokens: Math.ceil(echoContent.length / 4),
+            },
+        };
+    }
 }
+
+export class UpstreamProxyError extends Error {
+    readonly status: number;
+    readonly payload: { error: { message: string } };
+
+    constructor(
+        message: string,
+        upstreamStatus: number,
+        _contentType: string,
+        _body: string,
+        _mode: "sse" | "json",
+    ) {
+        super(message);
+        this.name = "UpstreamProxyError";
+        this.status = upstreamStatus >= 400 && upstreamStatus < 600 ? upstreamStatus : 502;
+        this.payload = {error: {message}};
+    }
+}
+
+const parseUpstreamChatCompletionJson = (
+    json: unknown,
+): { assistantText: string; toolCalls: ToolCall[]; model: string; usage: unknown | null } => {
+    const obj = json as Record<string, unknown> | null;
+    const model = typeof obj?.model === "string" ? obj.model : "custom-llm";
+    const usage = obj?.usage ?? null;
+
+    const choice = (obj?.choices as unknown[])?.[0] as Record<string, unknown> | undefined;
+    const message = choice?.message as Record<string, unknown> | undefined;
+
+    const assistantText = typeof message?.content === "string" ? message.content : "";
+    const toolCalls = Array.isArray(message?.tool_calls) ? (message.tool_calls as ToolCall[]) : [];
+
+    return {assistantText, toolCalls, model, usage};
+};
 
 const ensureUrl = (input: string): URL | null => {
     try {
@@ -420,6 +542,292 @@ const readSSEAndAssembleChatCompletion = async (
     return {assistantText, toolCalls: toolCalls.filter(Boolean), model, usage};
 };
 
+// Anthropic <-> OpenAI conversion functions
+const anthropicToOpenAIMessages = (
+    messages: AnthropicMessagesRequest["messages"],
+    system?: string,
+): ChatCompletionsMessage[] => {
+    const result: ChatCompletionsMessage[] = [];
+
+    if (system) {
+        result.push({role: "system", content: system});
+    }
+
+    for (const msg of messages) {
+        if (typeof msg.content === "string") {
+            result.push({role: msg.role, content: msg.content});
+            continue;
+        }
+
+        for (const block of msg.content) {
+            if (block.type === "text") {
+                result.push({role: msg.role, content: block.text});
+            } else if (block.type === "tool_use") {
+                result.push({
+                    role: "assistant",
+                    content: "",
+                    tool_calls: [{
+                        id: block.id,
+                        type: "function",
+                        function: {
+                            name: block.name,
+                            arguments: typeof block.input === "string" ? block.input : JSON.stringify(block.input),
+                        },
+                    }],
+                });
+            } else if (block.type === "tool_result") {
+                result.push({
+                    role: "tool",
+                    tool_call_id: block.tool_use_id,
+                    content: block.content,
+                });
+            }
+        }
+    }
+
+    return result;
+};
+
+const anthropicToOpenAITools = (
+    tools?: AnthropicMessagesRequest["tools"],
+): ChatCompletionsTool[] | undefined => {
+    if (!tools || tools.length === 0) return undefined;
+
+    return tools.map((tool) => ({
+        type: "function" as const,
+        function: {
+            name: tool.name,
+            description: tool.description,
+            parameters: tool.input_schema,
+        },
+    }));
+};
+
+const anthropicToOpenAIToolChoice = (
+    toolChoice?: AnthropicMessagesRequest["tool_choice"],
+): ChatCompletionsToolChoice | undefined => {
+    if (!toolChoice) return undefined;
+
+    if (toolChoice.type === "auto") return "auto";
+    if (toolChoice.type === "any") return "required";
+    if (toolChoice.type === "tool") {
+        return {type: "function", function: {name: toolChoice.name}};
+    }
+
+    return undefined;
+};
+
+const openAIToAnthropicResponse = (
+    json: unknown,
+    model: string,
+): AnthropicMessagesResponse => {
+    const obj = json as Record<string, unknown>;
+    const choice = (obj?.choices as unknown[])?.[0] as Record<string, unknown> | undefined;
+    const message = choice?.message as Record<string, unknown> | undefined;
+
+    const content: Array<{ type: "text"; text: string } | {
+        type: "tool_use";
+        id: string;
+        name: string;
+        input: unknown
+    }> = [];
+
+    if (typeof message?.content === "string" && message.content) {
+        content.push({type: "text", text: message.content});
+    }
+
+    const toolCalls = message?.tool_calls as ToolCall[] | undefined;
+    if (Array.isArray(toolCalls)) {
+        for (const tc of toolCalls) {
+            let input: unknown = {};
+            try {
+                input = JSON.parse(tc.function.arguments);
+            } catch {
+                input = tc.function.arguments;
+            }
+            content.push({
+                type: "tool_use",
+                id: tc.id,
+                name: tc.function.name,
+                input,
+            });
+        }
+    }
+
+    const finishReason = choice?.finish_reason as string | undefined;
+    let stopReason: AnthropicMessagesResponse["stop_reason"] = "end_turn";
+    if (finishReason === "length") stopReason = "max_tokens";
+    else if (finishReason === "stop") stopReason = "end_turn";
+    else if (finishReason === "tool_calls") stopReason = "tool_use";
+
+    const usage = obj?.usage as { prompt_tokens?: number; completion_tokens?: number } | undefined;
+
+    return {
+        id: `msg_${crypto.randomUUID()}`,
+        type: "message",
+        role: "assistant",
+        content,
+        model: (obj?.model as string) || model,
+        stop_reason: stopReason,
+        stop_sequence: null,
+        usage: {
+            input_tokens: usage?.prompt_tokens ?? 0,
+            output_tokens: usage?.completion_tokens ?? 0,
+        },
+    };
+};
+
+const createAnthropicStreamFromOpenAI = (
+    upstreamResp: Response,
+    model: string,
+): ReadableStream<Uint8Array> => {
+    const encoder = new TextEncoder();
+    const decoder = new TextDecoder("utf-8");
+    const reader = upstreamResp.body?.getReader();
+
+    if (!reader) {
+        throw new Error("Upstream response has no body");
+    }
+
+    let buffer = "";
+    let sentMessageStart = false;
+    let contentBlockStarted = false;
+    let currentToolCallIndex = -1;
+    const toolCallsInProgress: Map<number, { id: string; name: string; arguments: string }> = new Map();
+
+    const msgId = `msg_${crypto.randomUUID()}`;
+
+    return new ReadableStream<Uint8Array>({
+        async pull(controller) {
+            const {done, value} = await reader.read();
+
+            if (done) {
+                if (contentBlockStarted) {
+                    controller.enqueue(encoder.encode(`event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n`));
+                }
+                controller.enqueue(encoder.encode(`event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null}}\n\n`));
+                controller.enqueue(encoder.encode(`event: message_stop\ndata: {"type":"message_stop"}\n\n`));
+                controller.close();
+                return;
+            }
+
+            buffer += decoder.decode(value, {stream: true});
+
+            let idx: number;
+            while ((idx = buffer.indexOf("\n")) !== -1) {
+                const line = buffer.slice(0, idx).trimEnd();
+                buffer = buffer.slice(idx + 1);
+
+                if (!line.startsWith("data:")) continue;
+
+                const data = line.slice(5).trim();
+                if (!data || data === "[DONE]") continue;
+
+                let obj: any;
+                try {
+                    obj = JSON.parse(data);
+                } catch {
+                    continue;
+                }
+
+                if (!sentMessageStart) {
+                    const startEvent: AnthropicStreamEvent = {
+                        type: "message_start",
+                        message: {
+                            id: msgId,
+                            type: "message",
+                            role: "assistant",
+                            content: [],
+                            model: obj?.model || model,
+                            stop_reason: null,
+                            stop_sequence: null,
+                            usage: {input_tokens: 0, output_tokens: 0},
+                        },
+                    };
+                    controller.enqueue(encoder.encode(`event: message_start\ndata: ${JSON.stringify(startEvent)}\n\n`));
+                    sentMessageStart = true;
+                }
+
+                const delta = obj?.choices?.[0]?.delta;
+                if (!delta) continue;
+
+                // Handle text content
+                if (typeof delta.content === "string" && delta.content) {
+                    if (!contentBlockStarted) {
+                        controller.enqueue(encoder.encode(`event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n`));
+                        contentBlockStarted = true;
+                    }
+                    const deltaEvent = {
+                        type: "content_block_delta",
+                        index: 0,
+                        delta: {type: "text_delta", text: delta.content},
+                    };
+                    controller.enqueue(encoder.encode(`event: content_block_delta\ndata: ${JSON.stringify(deltaEvent)}\n\n`));
+                }
+
+                // Handle tool calls
+                if (Array.isArray(delta.tool_calls)) {
+                    for (const tc of delta.tool_calls) {
+                        const tcIndex = tc.index ?? 0;
+
+                        if (!toolCallsInProgress.has(tcIndex)) {
+                            if (contentBlockStarted && currentToolCallIndex === -1) {
+                                controller.enqueue(encoder.encode(`event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n`));
+                            }
+                            currentToolCallIndex = tcIndex;
+                            toolCallsInProgress.set(tcIndex, {
+                                id: tc.id || "",
+                                name: tc.function?.name || "",
+                                arguments: "",
+                            });
+
+                            const blockStart = {
+                                type: "content_block_start",
+                                index: tcIndex + 1,
+                                content_block: {
+                                    type: "tool_use",
+                                    id: tc.id || "",
+                                    name: tc.function?.name || "",
+                                    input: {},
+                                },
+                            };
+                            controller.enqueue(encoder.encode(`event: content_block_start\ndata: ${JSON.stringify(blockStart)}\n\n`));
+                        }
+
+                        const existing = toolCallsInProgress.get(tcIndex)!;
+                        if (tc.function?.arguments) {
+                            existing.arguments += tc.function.arguments;
+                            const deltaEvent = {
+                                type: "content_block_delta",
+                                index: tcIndex + 1,
+                                delta: {type: "input_json_delta", partial_json: tc.function.arguments},
+                            };
+                            controller.enqueue(encoder.encode(`event: content_block_delta\ndata: ${JSON.stringify(deltaEvent)}\n\n`));
+                        }
+                    }
+                }
+
+                // Handle finish reason
+                const finishReason = obj?.choices?.[0]?.finish_reason;
+                if (finishReason) {
+                    for (const [tcIdx] of toolCallsInProgress) {
+                        controller.enqueue(encoder.encode(`event: content_block_stop\ndata: {"type":"content_block_stop","index":${tcIdx + 1}}\n\n`));
+                    }
+
+                    let stopReason = "end_turn";
+                    if (finishReason === "length") stopReason = "max_tokens";
+                    else if (finishReason === "tool_calls") stopReason = "tool_use";
+
+                    controller.enqueue(encoder.encode(`event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"${stopReason}","stop_sequence":null}}\n\n`));
+                    controller.enqueue(encoder.encode(`event: message_stop\ndata: {"type":"message_stop"}\n\n`));
+                    controller.close();
+                    return;
+                }
+            }
+        },
+    });
+};
+
 export class ProxyLlmService implements LlmService {
     constructor(
         private readonly serviceName: string,
@@ -434,11 +842,32 @@ export class ProxyLlmService implements LlmService {
         return {status: "ok", service: this.serviceName, version: this.version};
     }
 
-    listModels(): ModelListResponse {
-        return {
-            object: "list",
-            data: buildModelsList(this.modelRepository.listModels(), this.serviceName),
-        };
+    async listModels(): Promise<ModelListResponse> {
+        const upstreamModelsUrl = upstreamUrlFor(this.customLlmUrl, "/v1/models");
+        if (!upstreamModelsUrl) {
+            return {
+                object: "list",
+                data: buildModelsList(this.modelRepository.listModels(), this.serviceName),
+            };
+        }
+
+        const upstreamResp = await fetch(upstreamModelsUrl, {
+            method: "GET",
+            headers: authHeadersForUpstream(this.customLlmKey),
+        });
+
+        if (!upstreamResp.ok) {
+            const errText = await upstreamResp.text().catch(() => "");
+            throw new UpstreamProxyError(
+                "Upstream models request failed",
+                upstreamResp.status,
+                upstreamResp.headers.get("content-type") || "",
+                errText,
+                "json",
+            );
+        }
+
+        return (await upstreamResp.json()) as ModelListResponse;
     }
 
     async createResponse(body: unknown): Promise<ResponseResponse> {
@@ -490,24 +919,34 @@ export class ProxyLlmService implements LlmService {
             throw new Error("CUSTOM_LLM_URL is not set/invalid");
         }
 
+        const upstreamStream = request.stream === true;
+
         const upstreamResp = await fetch(upstreamChatUrl, {
             method: "POST",
-            headers: {...authHeadersForUpstream(this.customLlmKey), accept: "text/event-stream"},
-            body: JSON.stringify({...chatReq, stream: true}),
+            headers: {
+                ...authHeadersForUpstream(this.customLlmKey),
+                accept: upstreamStream ? "text/event-stream" : "application/json",
+            },
+            body: JSON.stringify({...chatReq, stream: upstreamStream}),
         });
 
         const contentType = upstreamResp.headers.get("content-type") || "";
         if (!upstreamResp.ok) {
             const errText = await upstreamResp.text().catch(() => "");
-            throw new Error(`Upstream error ${upstreamResp.status}: ${errText}`);
+            throw new UpstreamProxyError(
+                "Upstream request failed",
+                upstreamResp.status,
+                contentType,
+                errText,
+                upstreamStream ? "sse" : "json",
+            );
         }
 
-        if (!contentType.includes("text/event-stream")) {
-            const text = await upstreamResp.text().catch(() => "");
-            throw new Error(`Expected SSE from upstream, got ${contentType}: ${text}`);
-        }
+        const isSse = contentType.includes("text/event-stream");
 
-        const assembled = await readSSEAndAssembleChatCompletion(upstreamResp);
+        const assembled = isSse
+            ? await readSSEAndAssembleChatCompletion(upstreamResp)
+            : parseUpstreamChatCompletionJson(await upstreamResp.json());
 
         let assistantText = assembled.assistantText || "";
         const toolCalls = assembled.toolCalls || [];
@@ -575,5 +1014,58 @@ export class ProxyLlmService implements LlmService {
         const content = assembled.assistantText || "";
 
         return buildChatCompletionResponse("chatcmpl", assembled.model || model, content);
+    }
+
+    async createAnthropicMessage(
+        body: AnthropicMessagesRequest,
+    ): Promise<AnthropicMessagesResponse | ReadableStream<Uint8Array>> {
+        const model = pickString(body.model, this.modelRepository.defaultModel());
+        const messages = anthropicToOpenAIMessages(body.messages, body.system);
+        const tools = anthropicToOpenAITools(body.tools);
+        const toolChoice = anthropicToOpenAIToolChoice(body.tool_choice);
+
+        const upstreamChatUrl = upstreamUrlFor(this.customLlmUrl, "/v1/chat/completions");
+        if (!upstreamChatUrl) {
+            throw new Error("CUSTOM_LLM_URL is not set/invalid");
+        }
+
+        const upstreamStream = body.stream === true;
+
+        const upstreamResp = await fetch(upstreamChatUrl, {
+            method: "POST",
+            headers: {
+                ...authHeadersForUpstream(this.customLlmKey),
+                accept: upstreamStream ? "text/event-stream" : "application/json",
+            },
+            body: JSON.stringify({
+                model,
+                messages,
+                stream: upstreamStream,
+                max_tokens: body.max_tokens,
+                temperature: body.temperature,
+                top_p: body.top_p,
+                tools,
+                tool_choice: toolChoice,
+                stop: body.stop_sequences,
+            }),
+        });
+
+        if (!upstreamResp.ok) {
+            const errText = await upstreamResp.text().catch(() => "");
+            throw new UpstreamProxyError(
+                "Upstream request failed",
+                upstreamResp.status,
+                upstreamResp.headers.get("content-type") || "",
+                errText,
+                upstreamStream ? "sse" : "json",
+            );
+        }
+
+        if (upstreamStream) {
+            return createAnthropicStreamFromOpenAI(upstreamResp, model);
+        }
+
+        const json = await upstreamResp.json();
+        return openAIToAnthropicResponse(json, model);
     }
 }
