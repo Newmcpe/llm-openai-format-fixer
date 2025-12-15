@@ -257,9 +257,10 @@ export class UpstreamProxyError extends Error {
 
 const parseUpstreamChatCompletionJson = (
     json: unknown,
+    requestedModel: string,
 ): { assistantText: string; toolCalls: ToolCall[]; model: string; usage: unknown | null } => {
     const obj = json as Record<string, unknown> | null;
-    const model = typeof obj?.model === "string" ? obj.model : "custom-llm";
+    const model = typeof obj?.model === "string" ? obj.model : requestedModel;
     const usage = obj?.usage ?? null;
 
     const choice = (obj?.choices as unknown[])?.[0] as Record<string, unknown> | undefined;
@@ -474,6 +475,7 @@ const extractProbablyJSON = (text: string): unknown | null => {
 
 const readSSEAndAssembleChatCompletion = async (
     upstreamResp: Response,
+    requestedModel: string,
 ): Promise<{ assistantText: string; toolCalls: ToolCall[]; model: string; usage: unknown | null }> => {
     const decoder = new TextDecoder("utf-8");
     const reader = upstreamResp.body?.getReader();
@@ -484,7 +486,7 @@ const readSSEAndAssembleChatCompletion = async (
 
     let buffer = "";
     let assistantText = "";
-    let model = "custom-llm";
+    let model = requestedModel;
     let usage: unknown | null = null;
     let chunkCount = 0;
 
@@ -1013,11 +1015,11 @@ export class ProxyLlmService implements LlmService {
 
         let assembled;
         if (isSse) {
-            assembled = await readSSEAndAssembleChatCompletion(upstreamResp);
+            assembled = await readSSEAndAssembleChatCompletion(upstreamResp, model);
         } else {
             const json = await upstreamResp.json();
             log("info", "upstream_response", {body: safePreview(json)});
-            assembled = parseUpstreamChatCompletionJson(json);
+            assembled = parseUpstreamChatCompletionJson(json, model);
         }
         log("info", "upstream_assembled", {body: safePreview(assembled)});
 
@@ -1109,11 +1111,11 @@ export class ProxyLlmService implements LlmService {
         let assembled;
         if (isSse) {
             log("info", "upstream_streaming_started");
-            assembled = await readSSEAndAssembleChatCompletion(upstreamResp);
+            assembled = await readSSEAndAssembleChatCompletion(upstreamResp, model);
         } else {
             const json = await upstreamResp.json();
             log("info", "upstream_response", {body: safePreview(json)});
-            assembled = parseUpstreamChatCompletionJson(json);
+            assembled = parseUpstreamChatCompletionJson(json, model);
         }
         log("info", "upstream_assembled", {body: safePreview(assembled)});
         const content = assembled.assistantText || "";
