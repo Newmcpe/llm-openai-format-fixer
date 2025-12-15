@@ -12,6 +12,28 @@ import {
     type ToolCall,
 } from "../utils/responses";
 import {pickString, pickValue} from "../utils/validation";
+import * as fs from "fs";
+import * as path from "path";
+
+const logDir = path.join(process.cwd(), "logs");
+if (!fs.existsSync(logDir)) {
+    fs.mkdirSync(logDir, {recursive: true});
+}
+const logFileName = `proxy-${new Date().toISOString().replace(/[:.]/g, "-")}.log`;
+const logFilePath = path.join(logDir, logFileName);
+const logStream = fs.createWriteStream(logFilePath, {flags: "a"});
+
+const safePreview = (val: unknown, max = 1200): string | null => {
+    if (val == null) return null;
+    const s = typeof val === "string" ? val : JSON.stringify(val);
+    return s.length > max ? s.slice(0, max) + `…(+${s.length - max} chars)` : s;
+};
+
+const log = (level: string, msg: string, meta: Record<string, unknown> = {}) => {
+    const logEntry = JSON.stringify({ts: new Date().toISOString(), level, msg, ...meta});
+    console.log(logEntry);
+    logStream.write(logEntry + "\n");
+};
 
 type ResponseTextFormat =
     | { type: "text" }
@@ -464,14 +486,27 @@ const readSSEAndAssembleChatCompletion = async (
     let assistantText = "";
     let model = "custom-llm";
     let usage: unknown | null = null;
+    let chunkCount = 0;
 
     const toolCalls: ToolCall[] = [];
 
     while (true) {
         const {done, value} = await reader.read();
-        if (done) break;
+        if (done) {
+            log("info", "sse_stream_done", {
+                chunkCount,
+                assistantTextLength: assistantText.length,
+                toolCallsCount: toolCalls.length
+            });
+            break;
+        }
 
-        buffer += decoder.decode(value, {stream: true});
+        const chunk = decoder.decode(value, {stream: true});
+        chunkCount++;
+        if (chunkCount <= 3) {
+            log("info", "sse_chunk", {chunkNum: chunkCount, chunk: safePreview(chunk, 500)});
+        }
+        buffer += chunk;
 
         let idx: number;
         while ((idx = buffer.indexOf("\n")) !== -1) {
@@ -509,6 +544,9 @@ const readSSEAndAssembleChatCompletion = async (
             const delta = obj?.choices?.[0]?.delta;
             if (typeof delta?.content === "string") {
                 assistantText += delta.content;
+            }
+            if (typeof delta?.reasoning_content === "string") {
+                assistantText += delta.reasoning_content;
             }
             if (typeof delta?.text === "string") {
                 assistantText += delta.text;
@@ -693,6 +731,8 @@ const createAnthropicStreamFromOpenAI = (
     let sentMessageStart = false;
     let contentBlockStarted = false;
     let currentToolCallIndex = -1;
+    let pullCount = 0;
+    let totalTextLength = 0;
     const toolCallsInProgress: Map<number, { id: string; name: string; arguments: string }> = new Map();
 
     const msgId = `msg_${crypto.randomUUID()}`;
@@ -700,8 +740,14 @@ const createAnthropicStreamFromOpenAI = (
     return new ReadableStream<Uint8Array>({
         async pull(controller) {
             const {done, value} = await reader.read();
+            pullCount++;
 
             if (done) {
+                log("info", "anthropic_stream_done", {
+                    pullCount,
+                    totalTextLength,
+                    toolCallsCount: toolCallsInProgress.size
+                });
                 if (contentBlockStarted) {
                     controller.enqueue(encoder.encode(`event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n`));
                 }
@@ -711,7 +757,11 @@ const createAnthropicStreamFromOpenAI = (
                 return;
             }
 
-            buffer += decoder.decode(value, {stream: true});
+            const chunk = decoder.decode(value, {stream: true});
+            if (pullCount <= 3) {
+                log("info", "anthropic_stream_chunk", {pullNum: pullCount, chunk: safePreview(chunk, 500)});
+            }
+            buffer += chunk;
 
             let idx: number;
             while ((idx = buffer.indexOf("\n")) !== -1) {
@@ -751,8 +801,10 @@ const createAnthropicStreamFromOpenAI = (
                 const delta = obj?.choices?.[0]?.delta;
                 if (!delta) continue;
 
-                // Handle text content
-                if (typeof delta.content === "string" && delta.content) {
+                // Handle text content (including reasoning_content from thinking models)
+                const textContent = delta.content ?? delta.reasoning_content;
+                if (typeof textContent === "string" && textContent) {
+                    totalTextLength += textContent.length;
                     if (!contentBlockStarted) {
                         controller.enqueue(encoder.encode(`event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n`));
                         contentBlockStarted = true;
@@ -760,7 +812,7 @@ const createAnthropicStreamFromOpenAI = (
                     const deltaEvent = {
                         type: "content_block_delta",
                         index: 0,
-                        delta: {type: "text_delta", text: delta.content},
+                        delta: {type: "text_delta", text: textContent},
                     };
                     controller.enqueue(encoder.encode(`event: content_block_delta\ndata: ${JSON.stringify(deltaEvent)}\n\n`));
                 }
@@ -810,6 +862,12 @@ const createAnthropicStreamFromOpenAI = (
                 // Handle finish reason
                 const finishReason = obj?.choices?.[0]?.finish_reason;
                 if (finishReason) {
+                    // Close text content block if it was started
+                    if (contentBlockStarted) {
+                        controller.enqueue(encoder.encode(`event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n`));
+                    }
+
+                    // Close tool call blocks
                     for (const [tcIdx] of toolCallsInProgress) {
                         controller.enqueue(encoder.encode(`event: content_block_stop\ndata: {"type":"content_block_stop","index":${tcIdx + 1}}\n\n`));
                     }
@@ -851,6 +909,8 @@ export class ProxyLlmService implements LlmService {
             };
         }
 
+        log("info", "upstream_request", {method: "GET", url: upstreamModelsUrl});
+
         const upstreamResp = await fetch(upstreamModelsUrl, {
             method: "GET",
             headers: authHeadersForUpstream(this.customLlmKey),
@@ -858,6 +918,7 @@ export class ProxyLlmService implements LlmService {
 
         if (!upstreamResp.ok) {
             const errText = await upstreamResp.text().catch(() => "");
+            log("error", "upstream_error", {status: upstreamResp.status, body: safePreview(errText, 2000)});
             throw new UpstreamProxyError(
                 "Upstream models request failed",
                 upstreamResp.status,
@@ -867,7 +928,9 @@ export class ProxyLlmService implements LlmService {
             );
         }
 
-        return (await upstreamResp.json()) as ModelListResponse;
+        const json = await upstreamResp.json();
+        log("info", "upstream_response", {body: safePreview(json)});
+        return json as ModelListResponse;
     }
 
     async createResponse(body: unknown): Promise<ResponseResponse> {
@@ -921,18 +984,22 @@ export class ProxyLlmService implements LlmService {
 
         const upstreamStream = request.stream === true;
 
+        const requestBody = {...chatReq, stream: upstreamStream};
+        log("info", "upstream_request", {method: "POST", url: upstreamChatUrl, body: safePreview(requestBody)});
+
         const upstreamResp = await fetch(upstreamChatUrl, {
             method: "POST",
             headers: {
                 ...authHeadersForUpstream(this.customLlmKey),
                 accept: upstreamStream ? "text/event-stream" : "application/json",
             },
-            body: JSON.stringify({...chatReq, stream: upstreamStream}),
+            body: JSON.stringify(requestBody),
         });
 
         const contentType = upstreamResp.headers.get("content-type") || "";
         if (!upstreamResp.ok) {
             const errText = await upstreamResp.text().catch(() => "");
+            log("error", "upstream_error", {status: upstreamResp.status, body: safePreview(errText, 2000)});
             throw new UpstreamProxyError(
                 "Upstream request failed",
                 upstreamResp.status,
@@ -944,9 +1011,15 @@ export class ProxyLlmService implements LlmService {
 
         const isSse = contentType.includes("text/event-stream");
 
-        const assembled = isSse
-            ? await readSSEAndAssembleChatCompletion(upstreamResp)
-            : parseUpstreamChatCompletionJson(await upstreamResp.json());
+        let assembled;
+        if (isSse) {
+            assembled = await readSSEAndAssembleChatCompletion(upstreamResp);
+        } else {
+            const json = await upstreamResp.json();
+            log("info", "upstream_response", {body: safePreview(json)});
+            assembled = parseUpstreamChatCompletionJson(json);
+        }
+        log("info", "upstream_assembled", {body: safePreview(assembled)});
 
         let assistantText = assembled.assistantText || "";
         const toolCalls = assembled.toolCalls || [];
@@ -978,6 +1051,7 @@ export class ProxyLlmService implements LlmService {
     }
 
     async createChatCompletion(body: unknown): Promise<ChatCompletionResponse> {
+        const bodyObj = (body ?? {}) as Record<string, unknown>;
         const model = pickString(
             pickValue<string | undefined>(body, "model", undefined),
             this.modelRepository.defaultModel(),
@@ -988,29 +1062,60 @@ export class ProxyLlmService implements LlmService {
             throw new Error("messages[] is required");
         }
 
+        // Normalize messages: convert content arrays to strings for compatibility
+        const normalizedMessages = messages.map((msg) => {
+            if (Array.isArray(msg.content)) {
+                const textParts = msg.content
+                    .filter((part: any) => part?.type === "text")
+                    .map((part: any) => part?.text ?? "");
+                return {...msg, content: textParts.join("")};
+            }
+            return msg;
+        });
+
         const upstreamChatUrl = upstreamUrlFor(this.customLlmUrl, "/v1/chat/completions");
         if (!upstreamChatUrl) {
             throw new Error("CUSTOM_LLM_URL is not set/invalid");
         }
 
+        // Pass through all fields from the original request
+        const requestBody = {
+            ...bodyObj,
+            model,
+            messages: normalizedMessages,
+            stream: bodyObj.stream ?? true,
+        };
+        log("info", "upstream_request", {method: "POST", url: upstreamChatUrl, body: safePreview(requestBody)});
+
+        const isStreaming = requestBody.stream === true;
         const upstreamResp = await fetch(upstreamChatUrl, {
             method: "POST",
-            headers: {...authHeadersForUpstream(this.customLlmKey), accept: "text/event-stream"},
-            body: JSON.stringify({model, messages, stream: true}),
+            headers: {
+                ...authHeadersForUpstream(this.customLlmKey),
+                accept: isStreaming ? "text/event-stream" : "application/json",
+            },
+            body: JSON.stringify(requestBody),
         });
 
         const contentType = upstreamResp.headers.get("content-type") || "";
         if (!upstreamResp.ok) {
             const errText = await upstreamResp.text().catch(() => "");
+            log("error", "upstream_error", {status: upstreamResp.status, body: safePreview(errText, 2000)});
             throw new Error(`Upstream error ${upstreamResp.status}: ${errText}`);
         }
 
-        if (!contentType.includes("text/event-stream")) {
-            const text = await upstreamResp.text().catch(() => "");
-            throw new Error(`Expected SSE from upstream, got ${contentType}: ${text}`);
-        }
+        const isSse = contentType.includes("text/event-stream");
 
-        const assembled = await readSSEAndAssembleChatCompletion(upstreamResp);
+        let assembled;
+        if (isSse) {
+            log("info", "upstream_streaming_started");
+            assembled = await readSSEAndAssembleChatCompletion(upstreamResp);
+        } else {
+            const json = await upstreamResp.json();
+            log("info", "upstream_response", {body: safePreview(json)});
+            assembled = parseUpstreamChatCompletionJson(json);
+        }
+        log("info", "upstream_assembled", {body: safePreview(assembled)});
         const content = assembled.assistantText || "";
 
         return buildChatCompletionResponse("chatcmpl", assembled.model || model, content);
@@ -1031,27 +1136,31 @@ export class ProxyLlmService implements LlmService {
 
         const upstreamStream = body.stream === true;
 
+        const requestBody = {
+            model,
+            messages,
+            stream: upstreamStream,
+            max_tokens: body.max_tokens,
+            temperature: body.temperature,
+            top_p: body.top_p,
+            tools,
+            tool_choice: toolChoice,
+            stop: body.stop_sequences,
+        };
+        log("info", "upstream_request", {method: "POST", url: upstreamChatUrl, body: safePreview(requestBody)});
+
         const upstreamResp = await fetch(upstreamChatUrl, {
             method: "POST",
             headers: {
                 ...authHeadersForUpstream(this.customLlmKey),
                 accept: upstreamStream ? "text/event-stream" : "application/json",
             },
-            body: JSON.stringify({
-                model,
-                messages,
-                stream: upstreamStream,
-                max_tokens: body.max_tokens,
-                temperature: body.temperature,
-                top_p: body.top_p,
-                tools,
-                tool_choice: toolChoice,
-                stop: body.stop_sequences,
-            }),
+            body: JSON.stringify(requestBody),
         });
 
         if (!upstreamResp.ok) {
             const errText = await upstreamResp.text().catch(() => "");
+            log("error", "upstream_error", {status: upstreamResp.status, body: safePreview(errText, 2000)});
             throw new UpstreamProxyError(
                 "Upstream request failed",
                 upstreamResp.status,
@@ -1062,10 +1171,12 @@ export class ProxyLlmService implements LlmService {
         }
 
         if (upstreamStream) {
+            log("info", "upstream_streaming_started", {});
             return createAnthropicStreamFromOpenAI(upstreamResp, model);
         }
 
         const json = await upstreamResp.json();
+        log("info", "upstream_response", {body: safePreview(json)});
         return openAIToAnthropicResponse(json, model);
     }
 }
