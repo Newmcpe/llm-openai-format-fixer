@@ -266,7 +266,12 @@ const parseUpstreamChatCompletionJson = (
     const choice = (obj?.choices as unknown[])?.[0] as Record<string, unknown> | undefined;
     const message = choice?.message as Record<string, unknown> | undefined;
 
-    const assistantText = typeof message?.content === "string" ? message.content : "";
+    const assistantText =
+        typeof message?.content === "string"
+            ? message.content
+            : typeof (message as any)?.reasoning_content === "string"
+                ? ((message as any).reasoning_content as string)
+                : "";
     const toolCalls = Array.isArray(message?.tool_calls) ? (message.tool_calls as ToolCall[]) : [];
 
     return {assistantText, toolCalls, model, usage};
@@ -550,6 +555,13 @@ const readSSEAndAssembleChatCompletion = async (
             if (typeof delta?.text === "string") {
                 assistantText += delta.text;
             }
+            if (
+                typeof delta?.reasoning_content === "string" &&
+                typeof delta?.content !== "string" &&
+                typeof delta?.text !== "string"
+            ) {
+                assistantText += delta.reasoning_content;
+            }
 
             const deltaToolCalls = delta?.tool_calls;
             if (Array.isArray(deltaToolCalls)) {
@@ -767,15 +779,21 @@ const createChatCompletionPassThroughStream = (
                 chunkNum++;
                 const delta = obj?.choices?.[0]?.delta;
 
-                // Skip chunks that only have reasoning_content (no content)
-                if (delta?.reasoning_content && !delta?.content) {
-                    log("info", "skipping_reasoning_chunk", {chunkNum});
-                    continue;
-                }
+                // Map reasoning_content -> content for clients that expect content
+                if (delta && typeof delta === "object") {
+                    const reasoning = (delta as any).reasoning_content;
+                    const hasContent =
+                        typeof (delta as any).content === "string" ||
+                        typeof (delta as any).text === "string";
 
-                // Remove reasoning_content from delta if present alongside content
-                if (delta?.reasoning_content) {
-                    delete delta.reasoning_content;
+                    if (typeof reasoning === "string" && !hasContent) {
+                        log("info", "skipping_reasoning_chunk", {chunkNum});
+                        (delta as any).content = reasoning;
+                    }
+
+                    if (typeof reasoning !== "undefined") {
+                        delete (delta as any).reasoning_content;
+                    }
                 }
 
                 // Forward the (possibly modified) chunk
