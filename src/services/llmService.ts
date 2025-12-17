@@ -745,6 +745,15 @@ const createChatCompletionPassThroughStream = (
             const {done, value} = await reader.read();
 
             if (done) {
+                // Process any remaining data in buffer before closing
+                if (buffer.trim()) {
+                    const trimmed = buffer.trim();
+                    if (trimmed === "data: [DONE]") {
+                        controller.enqueue(encoder.encode(trimmed + "\n\n"));
+                    } else if (trimmed.startsWith("data: ")) {
+                        controller.enqueue(encoder.encode(trimmed + "\n\n"));
+                    }
+                }
                 log("info", "chat_completion_stream_done", {chunkNum});
                 controller.close();
                 return;
