@@ -777,26 +777,8 @@ const createChatCompletionPassThroughStream = (
                 }
 
                 chunkNum++;
-                const delta = obj?.choices?.[0]?.delta;
 
-                // Map reasoning_content -> content for clients that expect content
-                if (delta && typeof delta === "object") {
-                    const reasoning = (delta as any).reasoning_content;
-                    const hasContent =
-                        typeof (delta as any).content === "string" ||
-                        typeof (delta as any).text === "string";
-
-                    if (typeof reasoning === "string" && !hasContent) {
-                        log("info", "skipping_reasoning_chunk", {chunkNum});
-                        (delta as any).content = reasoning;
-                    }
-
-                    if (typeof reasoning !== "undefined") {
-                        delete (delta as any).reasoning_content;
-                    }
-                }
-
-                // Forward the (possibly modified) chunk
+                // Forward chunk as-is (passthrough reasoning_content and content)
                 const outputLine = `data: ${JSON.stringify(obj)}\n\n`;
                 controller.enqueue(encoder.encode(outputLine));
             }
