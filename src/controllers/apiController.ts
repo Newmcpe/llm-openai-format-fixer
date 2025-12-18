@@ -133,7 +133,6 @@ export const createApiController = (llmService: LlmService, proxyKey: string) =>
                     headers: {
                         "content-type": "text/event-stream",
                         "cache-control": "no-cache",
-                        "connection": "keep-alive",
                     },
                 });
             }
