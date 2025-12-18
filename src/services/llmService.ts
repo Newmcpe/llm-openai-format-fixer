@@ -956,44 +956,51 @@ const createAnthropicStreamFromOpenAI = (
     };
 
     return new ReadableStream<Uint8Array>({
-        async pull(controller) {
-            const {done, value} = await reader.read();
-            pullCount++;
+        async start(controller) {
+            try {
+                while (true) {
+                    const {done, value} = await reader.read();
+                    pullCount++;
 
-            if (done) {
-                log("info", "anthropic_stream_done", {
-                    pullCount,
-                    totalTextLength,
-                    toolCallsCount: toolCallsInProgress.size
-                });
-                // Process any remaining data in buffer before closing
-                if (buffer.trim()) {
-                    const lines = buffer.split("\n");
-                    for (const line of lines) {
-                        const trimmed = line.trim();
-                        if (trimmed && processLine(trimmed, controller)) {
-                            return; // Stream already closed by processLine
+                    if (done) {
+                        log("info", "anthropic_stream_done", {
+                            pullCount,
+                            totalTextLength,
+                            toolCallsCount: toolCallsInProgress.size
+                        });
+                        // Process any remaining data in buffer before closing
+                        if (buffer.trim()) {
+                            const lines = buffer.split("\n");
+                            for (const line of lines) {
+                                const trimmed = line.trim();
+                                if (trimmed && processLine(trimmed, controller)) {
+                                    return; // Stream already closed by processLine
+                                }
+                            }
+                        }
+                        closeStream(controller);
+                        return;
+                    }
+
+                    const chunk = decoder.decode(value, {stream: true});
+                    if (pullCount <= 5) {
+                        log("info", "anthropic_stream_chunk", {pullNum: pullCount, chunk: safePreview(chunk, 500)});
+                    }
+                    buffer += chunk;
+
+                    let idx: number;
+                    while ((idx = buffer.indexOf("\n")) !== -1) {
+                        const line = buffer.slice(0, idx).trimEnd();
+                        buffer = buffer.slice(idx + 1);
+
+                        if (processLine(line, controller)) {
+                            return; // Stream closed by processLine
                         }
                     }
                 }
-                closeStream(controller);
-                return;
-            }
-
-            const chunk = decoder.decode(value, {stream: true});
-            if (pullCount <= 3) {
-                log("info", "anthropic_stream_chunk", {pullNum: pullCount, chunk: safePreview(chunk, 500)});
-            }
-            buffer += chunk;
-
-            let idx: number;
-            while ((idx = buffer.indexOf("\n")) !== -1) {
-                const line = buffer.slice(0, idx).trimEnd();
-                buffer = buffer.slice(idx + 1);
-
-                if (processLine(line, controller)) {
-                    return; // Stream closed by processLine
-                }
+            } catch (err) {
+                log("error", "anthropic_stream_error", {error: String(err)});
+                controller.error(err);
             }
         },
         cancel() {
