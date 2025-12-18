@@ -1,4 +1,5 @@
 import type {Hono} from "hono";
+import {stream} from "hono/streaming";
 import type {ContentfulStatusCode} from "hono/utils/http-status";
 import {type AnthropicMessagesRequest, type LlmService, UpstreamProxyError} from "../services/llmService";
 import {readJsonBody} from "../utils/validation";
@@ -129,12 +130,10 @@ export const createApiController = (llmService: LlmService, proxyKey: string) =>
             const result = await llmService.createAnthropicMessage(body as AnthropicMessagesRequest);
 
             if (result instanceof ReadableStream) {
-                return new Response(result, {
-                    headers: {
-                        "content-type": "text/event-stream",
-                        "cache-control": "no-cache",
-                        "connection": "close",
-                    },
+                c.header("content-type", "text/event-stream");
+                c.header("cache-control", "no-cache");
+                return stream(c, async (s) => {
+                    await s.pipe(result);
                 });
             }
 
