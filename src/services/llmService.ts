@@ -812,9 +812,16 @@ const createAnthropicStreamFromOpenAI = (
 
     let buffer = "";
     let sentMessageStart = false;
-    let contentBlockStarted = false;
-    let contentBlockStopped = false;
-    let currentToolCallIndex = -1;
+
+    // Thinking block state (index 0 for thinking models)
+    let thinkingBlockStarted = false;
+    let thinkingBlockStopped = false;
+
+    // Text block state (index 1 for thinking models, index 0 for non-thinking)
+    let textBlockStarted = false;
+    let textBlockStopped = false;
+    let textBlockIndex = 0; // Will be 1 if thinking block exists
+
     let pullCount = 0;
     let totalTextLength = 0;
     const toolCallsInProgress: Map<number, { id: string; name: string; arguments: string }> = new Map();
@@ -823,15 +830,21 @@ const createAnthropicStreamFromOpenAI = (
     const msgId = `msg_${crypto.randomUUID()}`;
 
     const closeStream = (controller: ReadableStreamDefaultController<Uint8Array>, stopReason: string = "end_turn") => {
-        // Close text content block if started but not yet stopped
-        if (contentBlockStarted && !contentBlockStopped) {
+        // Close thinking block if started but not stopped
+        if (thinkingBlockStarted && !thinkingBlockStopped) {
             controller.enqueue(encoder.encode(`event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n`));
-            contentBlockStopped = true;
+            thinkingBlockStopped = true;
+        }
+        // Close text block if started but not stopped
+        if (textBlockStarted && !textBlockStopped) {
+            controller.enqueue(encoder.encode(`event: content_block_stop\ndata: {"type":"content_block_stop","index":${textBlockIndex}}\n\n`));
+            textBlockStopped = true;
         }
         // Close any unclosed tool call blocks
+        const toolBlockOffset = textBlockIndex + 1;
         for (const [tcIdx] of toolCallsInProgress) {
             if (!closedToolCallIndices.has(tcIdx)) {
-                controller.enqueue(encoder.encode(`event: content_block_stop\ndata: {"type":"content_block_stop","index":${tcIdx + 1}}\n\n`));
+                controller.enqueue(encoder.encode(`event: content_block_stop\ndata: {"type":"content_block_stop","index":${tcIdx + toolBlockOffset}}\n\n`));
                 closedToolCallIndices.add(tcIdx);
             }
         }
@@ -877,22 +890,46 @@ const createAnthropicStreamFromOpenAI = (
         const delta = obj?.choices?.[0]?.delta;
         const finishReason = obj?.choices?.[0]?.finish_reason;
 
-        // Handle text content (including reasoning_content for thinking models)
         if (delta) {
-            const textContent = delta.content ?? delta.reasoning_content;
-            if (typeof textContent === "string") {
-                // Start content block if not started
-                if (!contentBlockStarted) {
-                    controller.enqueue(encoder.encode(`event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n`));
-                    contentBlockStarted = true;
+            // Handle reasoning_content (thinking block) - index 0
+            if (typeof delta.reasoning_content === "string") {
+                if (!thinkingBlockStarted) {
+                    controller.enqueue(encoder.encode(`event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}\n\n`));
+                    thinkingBlockStarted = true;
+                    textBlockIndex = 1; // Text block will be at index 1
                 }
-                // Send delta even for empty strings to maintain event order
-                if (textContent) {
-                    totalTextLength += textContent.length;
+                if (delta.reasoning_content) {
+                    totalTextLength += delta.reasoning_content.length;
                     const deltaEvent = {
                         type: "content_block_delta",
                         index: 0,
-                        delta: {type: "text_delta", text: textContent},
+                        delta: {type: "thinking_delta", thinking: delta.reasoning_content},
+                    };
+                    controller.enqueue(encoder.encode(`event: content_block_delta\ndata: ${JSON.stringify(deltaEvent)}\n\n`));
+                }
+            }
+
+            // Handle content (text block) - index 1 if thinking exists, else index 0
+            if (typeof delta.content === "string") {
+                // Close thinking block before starting text block (with fake signature)
+                if (thinkingBlockStarted && !thinkingBlockStopped) {
+                    // Send fake signature delta (may not pass verification but some clients don't check)
+                    const fakeSignature = Buffer.from(`proxy-${msgId}-${Date.now()}`).toString("base64");
+                    controller.enqueue(encoder.encode(`event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"${fakeSignature}"}}\n\n`));
+                    controller.enqueue(encoder.encode(`event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n`));
+                    thinkingBlockStopped = true;
+                }
+
+                if (!textBlockStarted) {
+                    controller.enqueue(encoder.encode(`event: content_block_start\ndata: {"type":"content_block_start","index":${textBlockIndex},"content_block":{"type":"text","text":""}}\n\n`));
+                    textBlockStarted = true;
+                }
+                if (delta.content) {
+                    totalTextLength += delta.content.length;
+                    const deltaEvent = {
+                        type: "content_block_delta",
+                        index: textBlockIndex,
+                        delta: {type: "text_delta", text: delta.content},
                     };
                     controller.enqueue(encoder.encode(`event: content_block_delta\ndata: ${JSON.stringify(deltaEvent)}\n\n`));
                 }
@@ -900,16 +937,22 @@ const createAnthropicStreamFromOpenAI = (
 
             // Handle tool calls
             if (Array.isArray(delta.tool_calls)) {
+                // Close text block before starting tool calls
+                if (textBlockStarted && !textBlockStopped) {
+                    controller.enqueue(encoder.encode(`event: content_block_stop\ndata: {"type":"content_block_stop","index":${textBlockIndex}}\n\n`));
+                    textBlockStopped = true;
+                }
+                // Close thinking block if still open
+                if (thinkingBlockStarted && !thinkingBlockStopped) {
+                    controller.enqueue(encoder.encode(`event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n`));
+                    thinkingBlockStopped = true;
+                }
+
+                const toolBlockOffset = textBlockIndex + 1;
                 for (const tc of delta.tool_calls) {
                     const tcIndex = tc.index ?? 0;
 
                     if (!toolCallsInProgress.has(tcIndex)) {
-                        // Close text content block before starting tool calls
-                        if (contentBlockStarted && !contentBlockStopped && currentToolCallIndex === -1) {
-                            controller.enqueue(encoder.encode(`event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n`));
-                            contentBlockStopped = true;
-                        }
-                        currentToolCallIndex = tcIndex;
                         toolCallsInProgress.set(tcIndex, {
                             id: tc.id || "",
                             name: tc.function?.name || "",
@@ -918,7 +961,7 @@ const createAnthropicStreamFromOpenAI = (
 
                         const blockStart = {
                             type: "content_block_start",
-                            index: tcIndex + 1,
+                            index: tcIndex + toolBlockOffset,
                             content_block: {
                                 type: "tool_use",
                                 id: tc.id || "",
@@ -934,7 +977,7 @@ const createAnthropicStreamFromOpenAI = (
                         existing.arguments += tc.function.arguments;
                         const deltaEvent = {
                             type: "content_block_delta",
-                            index: tcIndex + 1,
+                            index: tcIndex + toolBlockOffset,
                             delta: {type: "input_json_delta", partial_json: tc.function.arguments},
                         };
                         controller.enqueue(encoder.encode(`event: content_block_delta\ndata: ${JSON.stringify(deltaEvent)}\n\n`));
