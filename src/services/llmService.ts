@@ -851,6 +851,9 @@ const createAnthropicStreamFromOpenAI = (
         controller.enqueue(encoder.encode(`event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"${stopReason}","stop_sequence":null}}\n\n`));
         controller.enqueue(encoder.encode(`event: message_stop\ndata: {"type":"message_stop"}\n\n`));
         controller.close();
+        // Also cancel the upstream reader to ensure connection closes
+        reader.cancel().catch(() => {
+        });
     };
 
     const processLine = (line: string, controller: ReadableStreamDefaultController<Uint8Array>): boolean => {
