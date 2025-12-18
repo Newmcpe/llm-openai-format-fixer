@@ -1003,6 +1003,7 @@ const createAnthropicStreamFromOpenAI = (
 
     return new ReadableStream<Uint8Array>({
         async start(controller) {
+            log("info", "anthropic_stream_started", {msgId});
             try {
                 while (true) {
                     const {done, value} = await reader.read();
@@ -1029,7 +1030,7 @@ const createAnthropicStreamFromOpenAI = (
                     }
 
                     const chunk = decoder.decode(value, {stream: true});
-                    if (pullCount <= 5) {
+                    if (pullCount <= 10 || pullCount % 20 === 0) {
                         log("info", "anthropic_stream_chunk", {pullNum: pullCount, chunk: safePreview(chunk, 500)});
                     }
                     buffer += chunk;
@@ -1049,7 +1050,8 @@ const createAnthropicStreamFromOpenAI = (
                 controller.error(err);
             }
         },
-        cancel() {
+        cancel(reason) {
+            log("info", "anthropic_stream_cancelled", {msgId, pullCount, totalTextLength, reason: String(reason)});
             reader.cancel();
         },
     });
