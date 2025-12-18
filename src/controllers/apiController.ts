@@ -135,7 +135,16 @@ export const createApiController = (llmService: LlmService, proxyKey: string) =>
                 c.header("connection", "close");
                 c.header("x-accel-buffering", "no"); // Disable nginx buffering
                 return stream(c, async (s) => {
-                    await s.pipe(result);
+                    const reader = result.getReader();
+                    try {
+                        while (true) {
+                            const {done, value} = await reader.read();
+                            if (done) break;
+                            await s.write(value);
+                        }
+                    } finally {
+                        reader.releaseLock();
+                    }
                 });
             }
 
