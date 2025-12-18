@@ -132,6 +132,8 @@ export const createApiController = (llmService: LlmService, proxyKey: string) =>
             if (result instanceof ReadableStream) {
                 c.header("content-type", "text/event-stream");
                 c.header("cache-control", "no-cache");
+                c.header("connection", "close");
+                c.header("x-accel-buffering", "no"); // Disable nginx buffering
                 return stream(c, async (s) => {
                     await s.pipe(result);
                 });
